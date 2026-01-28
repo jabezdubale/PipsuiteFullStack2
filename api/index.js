@@ -34,6 +34,14 @@ const getDB = () => {
     return pool;
 };
 
+// --- Server-Side Asset Definitions for Normalization ---
+const KNOWN_ASSETS = [
+    "XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF",
+    "EURJPY", "GBPJPY", "EURAUD", "EURGBP", "AUDJPY", "CADJPY", "CHFJPY",
+    "USOIL", "UKOIL", "XAGUSD", "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "ADAUSD", "SOLUSD", "BNBUSD",
+    "US30", "NAS100", "SPX500", "GER30", "UK100", "JP225"
+];
+
 // Helper to convert snake_case DB result to camelCase for frontend
 const toCamelCase = (row) => {
     const newRow = {};
@@ -68,6 +76,12 @@ const parseTradeRow = (row) => {
     t.plannedRewardQuote = row.planned_reward_quote ? parseFloat(row.planned_reward_quote) : undefined;
     t.plannedRiskUsd = row.planned_risk_usd ? parseFloat(row.planned_risk_usd) : undefined;
     t.plannedRewardUsd = row.planned_reward_usd ? parseFloat(row.planned_reward_usd) : undefined;
+    
+    // EA Fields
+    t.externalTradeId = row.external_trade_id;
+    t.rawSymbol = row.raw_symbol;
+    t.isPending = row.is_pending;
+    t.isBalanceUpdated = row.is_balance_updated;
 
     return t;
 };
@@ -76,6 +90,132 @@ const sanitizeNumber = (val) => {
     if (val === '' || val === null || val === undefined) return null;
     const n = parseFloat(val);
     return isNaN(n) ? null : n;
+};
+
+// --- EA Helpers ---
+
+const normalizeNumber = (val) => {
+    if (val === undefined || val === null || val === '') return null;
+    const n = parseFloat(val);
+    return isNaN(n) ? null : n;
+};
+
+const roundNumber = (val, decimals = 5) => {
+    const n = normalizeNumber(val);
+    if (n === null) return 0;
+    // Handle float precision issues
+    return Number(Math.round(n + 'e' + decimals) + 'e-' + decimals);
+};
+
+const normalizeSymbolToAssetPair = (rawSymbol) => {
+    if (!rawSymbol || typeof rawSymbol !== 'string') return 'UNKNOWN';
+    const s = rawSymbol.trim().toUpperCase();
+
+    // 1. Exact Match
+    if (KNOWN_ASSETS.includes(s)) return s;
+
+    // 2. Prefix Match (Longest First)
+    // Sort assets by length desc to match "US30" before "US" (if that existed)
+    const sortedAssets = [...KNOWN_ASSETS].sort((a, b) => b.length - a.length);
+    for (const asset of sortedAssets) {
+        if (s.startsWith(asset)) {
+            return asset;
+        }
+    }
+
+    // 3. Fallback: Clean and return
+    // Remove non-alphanumeric chars (e.g. "EUR/USD" -> "EURUSD")
+    const clean = s.replace(/[^A-Z0-9]/g, '');
+    
+    // Try matching cleaned version
+    for (const asset of sortedAssets) {
+        if (clean.startsWith(asset)) {
+            return asset;
+        }
+    }
+
+    return clean || s;
+};
+
+const normalizeEATag = (tag) => {
+    if (typeof tag !== 'string') return null;
+    const clean = tag.trim();
+    if (!clean) return null;
+    
+    let bare = clean;
+    if (bare.startsWith('#')) {
+        bare = bare.substring(1);
+    }
+    
+    const knownSetups = ['PDH', 'PDL', 'EQH', 'EQL', 'AsiaH', 'AsiaL', 'IntH', 'IntL'];
+    // Check if clean tag matches a known setup (case-insensitive)
+    const match = knownSetups.find(k => k.toLowerCase() === bare.toLowerCase());
+    
+    // If matched, force canonical casing and # prefix
+    if (match) {
+        return '#' + match;
+    }
+    
+    return clean;
+};
+
+const getOrCreateTradeByExternalId = async (db, accountId, externalTradeId, rawSymbol) => {
+    const res = await db.query(
+        'SELECT * FROM trades WHERE account_id = $1 AND external_trade_id = $2',
+        [accountId, externalTradeId]
+    );
+    if (res.rows.length > 0) return parseTradeRow(res.rows[0]);
+
+    // Create new pending trade if not found (Resilience for out-of-order events)
+    const internalId = 'trade_ea_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9);
+    const now = new Date().toISOString();
+    
+    // Normalize Symbol
+    const normalizedSymbol = normalizeSymbolToAssetPair(rawSymbol);
+    
+    // Insert with defaults for required columns
+    // Default is_pending to FALSE to handle out-of-order terminal events correctly
+    await db.query(
+        `INSERT INTO trades (
+            id, account_id, external_trade_id, 
+            symbol, raw_symbol, type, status, outcome, 
+            entry_price, quantity, fees, pnl, 
+            created_at, entry_date, 
+            tags, screenshots, partials, is_pending
+        ) VALUES (
+            $1, $2, $3, 
+            $4, $5, 'LONG', 'OPEN', 'Open', 
+            0, 0, 0, 0, 
+            $6, $6, 
+            '[]', '[]', '[]', false
+        )`,
+        [internalId, accountId, externalTradeId, normalizedSymbol, rawSymbol, now]
+    );
+    
+    const newTrade = await db.query('SELECT * FROM trades WHERE id = $1', [internalId]);
+    return parseTradeRow(newTrade.rows[0]);
+};
+
+const mergePendingTradeIntoPositionTrade = async (db, accountId, pendingId, positionId, rawSymbol) => {
+    const res = await db.query(
+        'SELECT * FROM trades WHERE account_id = $1 AND external_trade_id = $2',
+        [accountId, pendingId]
+    );
+    
+    if (res.rows.length > 0) {
+        const trade = res.rows[0];
+        // Ensure symbol is up to date if we have a rawSymbol passed in
+        const normalized = rawSymbol ? normalizeSymbolToAssetPair(rawSymbol) : trade.symbol;
+        
+        await db.query(
+            'UPDATE trades SET external_trade_id = $1, symbol = $2, raw_symbol = $3 WHERE id = $4',
+            [positionId, normalized, rawSymbol || trade.raw_symbol, trade.id]
+        );
+        const updated = await db.query('SELECT * FROM trades WHERE id = $1', [trade.id]);
+        return parseTradeRow(updated.rows[0]);
+    } else {
+        return getOrCreateTradeByExternalId(db, accountId, positionId, rawSymbol);
+    }
 };
 
 const safeJson = (val) => {
@@ -257,7 +397,10 @@ const ensureSchema = async (db) => {
             "final_stop_loss DECIMAL(20, 5)", "final_take_profit DECIMAL(20, 5)",
             "quote_currency VARCHAR(10)", "fx_rate_to_usd DECIMAL(20, 10)",
             "planned_risk_quote DECIMAL(20, 2)", "planned_reward_quote DECIMAL(20, 2)",
-            "planned_risk_usd DECIMAL(20, 2)", "planned_reward_usd DECIMAL(20, 2)"
+            "planned_risk_usd DECIMAL(20, 2)", "planned_reward_usd DECIMAL(20, 2)",
+            "external_trade_id VARCHAR(255)",
+            "raw_symbol VARCHAR(50)",
+            "is_pending BOOLEAN DEFAULT false"
         ];
 
         for (const colDef of columns) {
@@ -277,6 +420,17 @@ const ensureSchema = async (db) => {
         } catch (e) {
             console.warn("Currency update warning (non-fatal):", e.message);
         }
+
+        // 9. Create EA Event Logs Table
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS ea_event_logs (
+                event_id VARCHAR(255) PRIMARY KEY,
+                account_id VARCHAR(255) NOT NULL,
+                external_trade_id VARCHAR(255) NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
 
         isSchemaChecked = true;
     } catch (err) {
@@ -552,6 +706,473 @@ app.delete('/api/accounts/:id', async (req, res) => {
         res.json({ success: true });
     } catch (err) {
         await client.query('ROLLBACK');
+        res.status(500).json({ error: err.message });
+    } finally {
+        client.release();
+    }
+});
+
+// EA PING
+app.get('/api/ea/ping', (req, res) => {
+    const secret = req.headers['x-ea-secret'];
+    const expectedSecret = process.env.EA_SHARED_SECRET;
+
+    if (!expectedSecret || secret !== expectedSecret) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    res.status(200).json({ ok: true, timeUtc: new Date().toISOString() });
+});
+
+// EA WEBHOOK
+app.post('/api/ea/events', async (req, res) => {
+    // STRICT ISOLATION NOTE: This handler must NOT call external APIs (TwelveData/Gemini).
+    // It relies solely on the payload provided by the EA and existing DB data.
+
+    const secret = req.headers['x-ea-secret'];
+    const expectedSecret = process.env.EA_SHARED_SECRET;
+
+    // 1. Auth
+    if (!expectedSecret || secret !== expectedSecret) {
+        console.warn(`[EA] Unauthorized access attempt. IP: ${req.ip}`);
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // 2. Validate Body
+    const { eventId, accountId, externalTradeId, type, payload } = req.body;
+    
+    if (!eventId || typeof eventId !== 'string') return res.status(400).json({ error: 'Invalid or missing eventId' });
+    if (!accountId || typeof accountId !== 'string') return res.status(400).json({ error: 'Invalid or missing accountId' });
+    if (!externalTradeId || typeof externalTradeId !== 'string') return res.status(400).json({ error: 'Invalid or missing externalTradeId' });
+    if (!type || typeof type !== 'string') return res.status(400).json({ error: 'Invalid or missing type' });
+    if (!payload || typeof payload !== 'object') return res.status(400).json({ error: 'Invalid or missing payload' });
+
+    // Use a fresh client for transaction safety
+    const client = await req.db.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        // 3. Idempotency Check (Check before processing)
+        const existCheck = await client.query('SELECT 1 FROM ea_event_logs WHERE event_id = $1', [eventId]);
+        if (existCheck.rows.length > 0) {
+            await client.query('ROLLBACK');
+            return res.status(200).json({ message: 'Event already processed' });
+        }
+
+        // 4. Account Scoping
+        const accCheck = await client.query('SELECT id FROM accounts WHERE id = $1', [accountId]);
+        if (accCheck.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Account not found' });
+        }
+
+        // 5. Handle Event Types
+        if (type === 'ORDER_PLACED') {
+            const p = payload;
+            
+            // Ensure trade record exists (creates with default 0/nulls if new)
+            const t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, p.symbol);
+            
+            // Helpers
+            const val = (curr, next) => (curr !== null && curr !== undefined && curr !== '' && curr !== 0) ? curr : next;
+            
+            const nextSymbol = normalizeSymbolToAssetPair(p.symbol);
+            const nextRawSymbol = p.symbol;
+            const nextType = p.direction; 
+            const nextOrderType = p.orderType; 
+            const nextEntryPrice = normalizeNumber(p.plannedEntryPrice);
+            const nextSL = normalizeNumber(p.entryStopLoss);
+            const nextTP = normalizeNumber(p.entryTakeProfit);
+            const nextQty = normalizeNumber(p.quantity);
+            const nextDate = p.orderPlacedTimeUtc;
+            
+            const existingTags = t.tags || [];
+            const newTags = Array.isArray(p.tags) ? p.tags : [];
+            const tagSet = new Set(existingTags.map(tag => tag.toLowerCase().trim()));
+            const mergedTags = [...existingTags];
+            
+            newTags.forEach(rawTag => {
+                const clean = normalizeEATag(rawTag);
+                if (clean && !tagSet.has(clean.toLowerCase())) {
+                    tagSet.add(clean.toLowerCase());
+                    mergedTags.push(clean);
+                }
+            });
+
+            const nextNotes = (t.notes && t.notes.trim()) ? t.notes : (p.technicalNotes || '');
+
+            await client.query(
+                `UPDATE trades SET
+                    symbol = $1,
+                    raw_symbol = $2,
+                    type = $3,
+                    order_type = $4,
+                    entry_price = $5,
+                    stop_loss = $6,
+                    take_profit = $7,
+                    quantity = $8,
+                    entry_date = $9,
+                    notes = $10,
+                    tags = $11,
+                    is_pending = true,
+                    status = 'OPEN',
+                    outcome = 'Open'
+                 WHERE id = $12`,
+                [
+                    val(t.symbol, nextSymbol),
+                    val(t.rawSymbol, nextRawSymbol),
+                    val(t.type, nextType),
+                    val(t.orderType, nextOrderType),
+                    val(t.entryPrice, nextEntryPrice),
+                    val(t.stopLoss, nextSL),
+                    val(t.takeProfit, nextTP),
+                    val(t.quantity, nextQty),
+                    val(t.entryDate, nextDate),
+                    nextNotes,
+                    JSON.stringify(mergedTags),
+                    t.id
+                ]
+            );
+        } else if (type === 'TRADE_OPENED') {
+            const p = payload;
+            let t;
+
+            // 1. Merge Pending if applicable
+            if (p.pendingExternalTradeId) {
+                t = await mergePendingTradeIntoPositionTrade(client, accountId, p.pendingExternalTradeId, externalTradeId, p.symbol);
+            } else {
+                t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, p.symbol);
+            }
+
+            const nextSymbol = normalizeSymbolToAssetPair(p.symbol);
+            const nextRawSymbol = p.symbol;
+            
+            const nextEntryPrice = normalizeNumber(p.entryPrice);
+            const nextSL = normalizeNumber(p.entryStopLoss);
+            const nextTP = normalizeNumber(p.entryTakeProfit);
+            const nextQty = normalizeNumber(p.quantity);
+            const nextDate = p.entryTimeUtc;
+            
+            const nextType = p.direction;
+            const nextOrderType = p.orderType;
+
+            const existingTags = t.tags || [];
+            const newTags = Array.isArray(p.tags) ? p.tags : [];
+            const tagSet = new Set(existingTags.map(tag => tag.toLowerCase().trim()));
+            const mergedTags = [...existingTags];
+            
+            newTags.forEach(rawTag => {
+                const clean = normalizeEATag(rawTag);
+                if (clean && !tagSet.has(clean.toLowerCase())) {
+                    tagSet.add(clean.toLowerCase());
+                    mergedTags.push(clean);
+                }
+            });
+
+            const nextNotes = (t.notes && t.notes.trim()) ? t.notes : (p.technicalNotes || '');
+            const nextEmotional = (t.emotionalNotes && t.emotionalNotes.trim()) ? t.emotionalNotes : (p.emotionalNotes || '');
+
+            await client.query(
+                `UPDATE trades SET
+                    symbol = $1,
+                    raw_symbol = $2,
+                    type = $3,
+                    order_type = $4,
+                    entry_price = $5,
+                    stop_loss = $6,
+                    take_profit = $7,
+                    quantity = $8,
+                    entry_date = $9,
+                    notes = $10,
+                    emotional_notes = $11,
+                    tags = $12,
+                    is_pending = false,
+                    status = 'OPEN',
+                    outcome = 'Open'
+                 WHERE id = $13`,
+                [
+                    nextSymbol,
+                    nextRawSymbol,
+                    nextType,
+                    nextOrderType,
+                    nextEntryPrice,
+                    nextSL,
+                    nextTP,
+                    nextQty,
+                    nextDate,
+                    nextNotes,
+                    nextEmotional,
+                    JSON.stringify(mergedTags),
+                    t.id
+                ]
+            );
+        } else if (type === 'SLTP_UPDATED') {
+            const p = payload;
+            
+            // Resilience: Create trade if missing (late event)
+            const t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, null);
+            const tradeId = t.id;
+            const currentTags = t.tags || [];
+            
+            const newFinalSL = normalizeNumber(p.finalStopLoss);
+            const newFinalTP = normalizeNumber(p.finalTakeProfit);
+            
+            const entrySL = parseFloat(t.stopLoss);
+            const entryTP = parseFloat(t.takeProfit);
+
+            const tagSet = new Set(currentTags.map(tag => tag.toLowerCase().trim()));
+            const nextTags = [...currentTags];
+
+            const addTag = (tagName) => {
+                const clean = tagName.trim();
+                if (!tagSet.has(clean.toLowerCase())) {
+                    tagSet.add(clean.toLowerCase());
+                    nextTags.push(clean);
+                }
+            };
+
+            // Epsilon check (1e-6) and value check (> 0)
+            const epsilon = 0.000001;
+
+            if (!isNaN(entrySL) && newFinalSL !== null && entrySL > 0 && newFinalSL > 0) {
+                if (Math.abs(entrySL - newFinalSL) > epsilon) {
+                    addTag('#SL-Moved');
+                }
+            }
+
+            if (!isNaN(entryTP) && newFinalTP !== null && entryTP > 0 && newFinalTP > 0) {
+                if (Math.abs(entryTP - newFinalTP) > epsilon) {
+                    addTag('#TP-Moved');
+                }
+            }
+
+            await client.query(
+                `UPDATE trades SET
+                    final_stop_loss = $1,
+                    final_take_profit = $2,
+                    tags = $3
+                 WHERE id = $4`,
+                [
+                    newFinalSL,
+                    newFinalTP,
+                    JSON.stringify(nextTags),
+                    tradeId
+                ]
+            );
+        } else if (type === 'PARTIAL_CLOSED') {
+            const p = payload;
+            
+            // Resilience: Create trade if missing
+            const t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, null);
+            const tradeId = t.id;
+            
+            let currentPartials = t.partials || [];
+            if (typeof currentPartials === 'string') {
+                try { currentPartials = JSON.parse(currentPartials); } catch (e) { currentPartials = []; }
+            }
+            if (!Array.isArray(currentPartials)) currentPartials = [];
+
+            const partialExists = currentPartials.some(part => part.id === p.partialId);
+            
+            if (!partialExists) {
+                const newPnl = normalizeNumber(p.partialPnL);
+                
+                const newPartial = {
+                    id: p.partialId,
+                    quantity: normalizeNumber(p.closedVolume),
+                    price: normalizeNumber(p.closePrice),
+                    pnl: newPnl,
+                    date: p.partialTimeUtc
+                };
+                
+                const nextPartials = [...currentPartials, newPartial];
+                
+                let nextTags = t.tags || [];
+                if (typeof nextTags === 'string') {
+                     try { nextTags = JSON.parse(nextTags); } catch (e) { nextTags = []; }
+                }
+                if (!Array.isArray(nextTags)) nextTags = [];
+                
+                const tagSet = new Set(nextTags.map(tag => tag.toLowerCase().trim()));
+                const partialTagName = '#Partial';
+                if (!tagSet.has(partialTagName.toLowerCase())) {
+                    nextTags.push(partialTagName);
+                }
+
+                // IMPORTANT: Only update PnL if trade is already CLOSED.
+                // If open, we just store partials for reference/metrics, but main pnl is not finalized.
+                let nextPnl = t.pnl;
+                if (t.outcome === 'Closed') {
+                    const currentMainPnl = parseFloat(t.mainPnl || 0);
+                    const currentFees = parseFloat(t.fees || 0);
+                    const totalPartialsPnl = nextPartials.reduce((sum, part) => sum + (part.pnl || 0), 0);
+                    nextPnl = currentMainPnl + totalPartialsPnl - currentFees;
+                }
+
+                await client.query(
+                    `UPDATE trades SET
+                        partials = $1,
+                        tags = $2,
+                        pnl = $3
+                     WHERE id = $4`,
+                    [
+                        JSON.stringify(nextPartials),
+                        JSON.stringify(nextTags),
+                        nextPnl,
+                        tradeId
+                    ]
+                );
+            }
+        } else if (type === 'TRADE_CLOSED') {
+            const p = payload;
+            
+            // Resilience: Create trade if missing
+            const t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, null);
+            const tradeId = t.id;
+
+            let currentPartials = t.partials || [];
+            if (typeof currentPartials === 'string') {
+                try { currentPartials = JSON.parse(currentPartials); } catch (e) { currentPartials = []; }
+            }
+            if (!Array.isArray(currentPartials)) currentPartials = [];
+            
+            const partialsSum = currentPartials.reduce((sum, part) => sum + (parseFloat(part.pnl) || 0), 0);
+
+            const exitPrice = normalizeNumber(p.exitPrice);
+            const exitDate = p.exitTimeUtc; 
+            const totalGrossPnL = normalizeNumber(p.totalPnL) || 0;
+            const fees = normalizeNumber(p.feesUsd) || 0;
+            const finalSL = normalizeNumber(p.finalStopLoss);
+            const finalTP = normalizeNumber(p.finalTakeProfit);
+
+            const corePnL = totalGrossPnL - partialsSum;
+            const netPnL = totalGrossPnL - fees;
+
+            let status = 'BREAK_EVEN';
+            if (netPnL > 0) status = 'WIN';
+            else if (netPnL < 0) status = 'LOSS';
+
+            // Idempotent Balance Update
+            if (!t.isBalanceUpdated) {
+                await client.query(
+                    'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+                    [netPnL, accountId]
+                );
+            }
+
+            // Calculate moved tags (SL/TP Moved) redundancy check
+            let currentTags = t.tags || [];
+            if (typeof currentTags === 'string') {
+                 try { currentTags = JSON.parse(currentTags); } catch (e) { currentTags = []; }
+            }
+            if (!Array.isArray(currentTags)) currentTags = [];
+
+            const tagSet = new Set(currentTags.map(tag => tag.toLowerCase().trim()));
+            const nextTags = [...currentTags];
+            const addTag = (tagName) => {
+                const clean = tagName.trim();
+                if (!tagSet.has(clean.toLowerCase())) {
+                    tagSet.add(clean.toLowerCase());
+                    nextTags.push(clean);
+                }
+            };
+
+            const entrySL = parseFloat(t.stopLoss);
+            const entryTP = parseFloat(t.takeProfit);
+            const epsilon = 0.000001;
+
+            if (!isNaN(entrySL) && finalSL !== null && entrySL > 0 && finalSL > 0) {
+                if (Math.abs(entrySL - finalSL) > epsilon) {
+                    addTag('#SL-Moved');
+                }
+            }
+
+            if (!isNaN(entryTP) && finalTP !== null && entryTP > 0 && finalTP > 0) {
+                if (Math.abs(entryTP - finalTP) > epsilon) {
+                    addTag('#TP-Moved');
+                }
+            }
+
+            await client.query(
+                `UPDATE trades SET
+                    exit_price = $1,
+                    exit_date = $2,
+                    final_stop_loss = $3,
+                    final_take_profit = $4,
+                    fees = $5,
+                    main_pnl = $6,
+                    pnl = $7,
+                    status = $8,
+                    tags = $9,
+                    outcome = 'Closed',
+                    is_balance_updated = true,
+                    is_pending = false
+                 WHERE id = $10`,
+                [
+                    exitPrice,
+                    exitDate,
+                    finalSL,
+                    finalTP,
+                    fees,
+                    corePnL,
+                    netPnL,
+                    status,
+                    JSON.stringify(nextTags),
+                    tradeId
+                ]
+            );
+        } else if (type === 'ORDER_CANCELED') {
+            const p = payload;
+            const t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, null);
+            
+            let currentNotes = t.notes || '';
+            const appendMsg = 'closed trade by EA';
+            
+            if (!currentNotes.includes(appendMsg)) {
+                // Ensure clean newline handling
+                currentNotes = currentNotes ? `${currentNotes}\n${appendMsg}` : appendMsg;
+            }
+
+            await client.query(
+                `UPDATE trades SET
+                    outcome = 'Missed',
+                    status = 'MISSED',
+                    exit_date = $1,
+                    notes = $2,
+                    is_pending = false
+                 WHERE id = $3`,
+                [
+                    p.canceledTimeUtc,
+                    currentNotes,
+                    t.id
+                ]
+            );
+        }
+        
+        // 6. Log Event (Success)
+        await client.query(
+            'INSERT INTO ea_event_logs (event_id, account_id, external_trade_id, type) VALUES ($1, $2, $3, $4)',
+            [eventId, accountId, externalTradeId, type]
+        );
+
+        await client.query('COMMIT');
+        res.status(200).json({ success: true, message: 'Event accepted' });
+
+    } catch (err) {
+        await client.query('ROLLBACK');
+        
+        // Handle Idempotency / Constraint Violation gracefully if race condition occurs
+        if (err.code === '23505') { 
+            return res.status(200).json({ message: 'Event already processed (concurrent)' });
+        }
+        
+        if (err.code === '42P01') { 
+            await ensureSchema(req.db);
+            return res.status(500).json({ error: "Database schema updating. Please retry." });
+        }
+
+        console.error("[EA] Error processing event:", err);
         res.status(500).json({ error: err.message });
     } finally {
         client.release();

@@ -37,7 +37,7 @@ const DEFAULT_ACCOUNTS: Account[] = [{
 const DEFAULT_TAG_GROUPS: TagGroup[] = [
   {
     name: 'Technical',
-    tags: ['#BOS', '#CHoCH', '#OB', '#FVG', '#Liquidity-Sweep', '#POI-Entry', '#Inducement', '#Premium', '#Discount', '#Stop-Hunt', '#Mitigation', '#Eq-Highs', '#Eq-Lows']
+    tags: ['#BOS', '#CHoCH', '#OB', '#FVG', '#Liquidity-Sweep', '#POI-Entry', '#Inducement', '#Premium', '#Discount', '#Stop-Hunt', '#Mitigation', '#Eq-Highs', '#Eq-Lows', '#PDH', '#PDL', '#EQH', '#EQL', '#AsiaH', '#AsiaL', '#IntH', '#IntL']
   },
   {
     name: 'Execution',
@@ -49,7 +49,7 @@ const DEFAULT_TAG_GROUPS: TagGroup[] = [
   },
   {
     name: 'Risk Management',
-    tags: ['#Fixed-Risk', '#Wrong-Risk', '#BE-Aggressive', '#BE-Passive', '#Over-Leveraged', '#Multiple-Risk', '#Max-Drawdown', '#Daily-Drawdown', '#Recovery-Risk']
+    tags: ['#Fixed-Risk', '#Wrong-Risk', '#BE-Aggressive', '#BE-Passive', '#Over-Leveraged', '#Multiple-Risk', '#Max-Drawdown', '#Daily-Drawdown', '#Recovery-Risk', '#SL-Moved', '#TP-Moved']
   }
 ];
 
