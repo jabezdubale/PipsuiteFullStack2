@@ -20,7 +20,7 @@ import { getFxRateToUSD } from './services/fxService';
 import { computeTradeMetrics, calculateRiskPercentage, calculateQuantity, computePlannedValuesForSave } from './utils/tradeCalc';
 import { getBaseQuote } from './utils/symbol';
 import { Trade, TradeStats, Account, TradeType, TradeStatus, ASSETS, TagGroup, OrderType, Session, TradeOutcome, User } from './types';
-import { X, ChevronDown, Calculator, TrendingUp, TrendingDown, RefreshCw, Loader2, Upload, Plus, Trash2, Clipboard, ChevronUp, Eraser, User as UserIcon, Database, AlertTriangle } from 'lucide-react';
+import { X, ChevronDown, Calculator, TrendingUp, TrendingDown, RefreshCw, Loader2, Upload, Plus, Trash2, Clipboard, ChevronUp, Eraser, User as UserIcon, Database, AlertTriangle, Key } from 'lucide-react';
 import UserModal from './components/UserModal';
 import { compressImage, addScreenshot } from './utils/imageUtils';
 import { generateId } from './utils/idUtils';
@@ -43,6 +43,7 @@ function App() {
   
   // Selection State
   const [selectedAccountId, setSelectedAccountId] = useState<string>('');
+  const [expandedAccountId, setExpandedAccountId] = useState<string | null>(null);
 
   // Calendar State
   const [currentCalendarMonth, setCurrentCalendarMonth] = useState(new Date());
@@ -1189,26 +1190,57 @@ function App() {
                </div>
                
                <ul className="space-y-2">
-                 {accounts.map(acc => (
-                   <li key={acc.id} className="flex justify-between items-center p-3 bg-background rounded border border-border hover:border-primary/50 transition-colors">
-                     <div className="flex flex-col">
-                        <span className="font-medium text-sm">{acc.name}</span>
-                        <span className="text-xs text-textMuted">
-                           {acc.type ? `${acc.type} Account` : (acc.isDemo ? 'Demo Account' : 'Real Account')} - {acc.currency}
-                        </span>
+                 {accounts.map(acc => {
+                   const isExpanded = expandedAccountId === acc.id;
+                   return (
+                   <li key={acc.id} className="flex flex-col bg-background rounded border border-border hover:border-primary/50 transition-colors overflow-hidden">
+                     <div className="flex justify-between items-center p-3">
+                         <div className="flex flex-col">
+                            <span className="font-medium text-sm">{acc.name}</span>
+                            <span className="text-xs text-textMuted">
+                               {acc.type ? `${acc.type} Account` : (acc.isDemo ? 'Demo Account' : 'Real Account')} - {acc.currency}
+                            </span>
+                         </div>
+                         <div className="flex items-center gap-4">
+                            <span className="text-textMuted font-mono text-sm">${acc.balance.toLocaleString()}</span>
+                            <button 
+                                onClick={() => setExpandedAccountId(isExpanded ? null : acc.id)}
+                                className={`text-textMuted hover:text-primary transition-colors p-1 ${isExpanded ? 'text-primary' : ''}`}
+                                title="Show EA Credentials"
+                            >
+                                <Key size={16} />
+                            </button>
+                            <button 
+                                onClick={() => handleRequestDeleteAccount(acc)}
+                                className="text-textMuted hover:text-loss transition-colors p-1"
+                                title="Delete Account"
+                            >
+                                <Trash2 size={16} />
+                            </button>
+                         </div>
                      </div>
-                     <div className="flex items-center gap-4">
-                        <span className="text-textMuted font-mono text-sm">${acc.balance.toLocaleString()}</span>
-                        <button 
-                            onClick={() => handleRequestDeleteAccount(acc)}
-                            className="text-textMuted hover:text-loss transition-colors p-1"
-                            title="Delete Account"
-                        >
-                            <Trash2 size={16} />
-                        </button>
-                     </div>
+                     
+                     {isExpanded && (
+                         <div className="px-3 pb-3 pt-0 border-t border-border/30 bg-surfaceHighlight/5 space-y-2 animate-in slide-in-from-top-1">
+                             <div className="pt-2">
+                                 <label className="text-[10px] text-textMuted uppercase font-bold tracking-wider mb-1 block">JournalAccountId</label>
+                                 <div className="flex items-center gap-2 bg-surfaceHighlight/50 border border-border/50 rounded px-2 py-1.5">
+                                     <code className="text-xs text-textMain font-mono flex-1 truncate select-all">{acc.id}</code>
+                                     <button onClick={() => navigator.clipboard.writeText(acc.id)} className="text-textMuted hover:text-primary"><Clipboard size={12}/></button>
+                                 </div>
+                             </div>
+                             <div>
+                                 <label className="text-[10px] text-textMuted uppercase font-bold tracking-wider mb-1 block">JournalEASecret</label>
+                                 <div className="flex items-center gap-2 bg-surfaceHighlight/50 border border-border/50 rounded px-2 py-1.5">
+                                     <code className="text-xs text-textMain font-mono flex-1 truncate select-all">{acc.eaSecret || 'Not available'}</code>
+                                     <button onClick={() => navigator.clipboard.writeText(acc.eaSecret || '')} className="text-textMuted hover:text-primary"><Clipboard size={12}/></button>
+                                 </div>
+                             </div>
+                         </div>
+                     )}
                    </li>
-                 ))}
+                   );
+                 })}
                  {accounts.length === 0 && (
                      <li className="text-center py-4 text-textMuted text-sm italic">No accounts found.</li>
                  )}

@@ -49,6 +49,7 @@ export interface Account {
   balance: number;
   isDemo: boolean;
   type?: 'Real' | 'Demo' | 'Funded'; 
+  eaSecret?: string;
 }
 
 export interface TagGroup {

@@ -159,6 +159,10 @@ const normalizeEATag = (tag) => {
     return clean;
 };
 
+const generateSecret = () => {
+    return 'ea_' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+};
+
 const getOrCreateTradeByExternalId = async (db, accountId, externalTradeId, rawSymbol) => {
     const res = await db.query(
         'SELECT * FROM trades WHERE account_id = $1 AND external_trade_id = $2',
@@ -411,14 +415,22 @@ const ensureSchema = async (db) => {
             }
         }
 
-        // 8. Enforce USD Currency
+        // 8. Enforce USD Currency & EA Secret
         try {
-            // Update NULL or empty currency to USD
             await db.query("UPDATE accounts SET currency = 'USD' WHERE currency IS NULL OR currency = ''");
-            // Set Default
             await db.query("ALTER TABLE accounts ALTER COLUMN currency SET DEFAULT 'USD'");
+            
+            // Add EA Secret column
+            await db.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS ea_secret VARCHAR(255)`);
+            
+            // Backfill secrets for existing accounts
+            const nullSecrets = await db.query("SELECT id FROM accounts WHERE ea_secret IS NULL");
+            for (const row of nullSecrets.rows) {
+                const newSecret = generateSecret();
+                await db.query("UPDATE accounts SET ea_secret = $1 WHERE id = $2", [newSecret, row.id]);
+            }
         } catch (e) {
-            console.warn("Currency update warning (non-fatal):", e.message);
+            console.warn("Schema update warning (non-fatal):", e.message);
         }
 
         // 9. Create EA Event Logs Table
@@ -611,7 +623,8 @@ app.get('/api/accounts', async (req, res) => {
             currency: row.currency,
             balance: parseFloat(row.balance),
             isDemo: row.is_demo,
-            type: row.type
+            type: row.type,
+            eaSecret: row.ea_secret // Include Secret for UI
         })));
     } catch (err) {
         if (err.code === '42P01' || err.code === '42703') { await ensureSchema(req.db); return res.json([]); }
@@ -620,15 +633,20 @@ app.get('/api/accounts', async (req, res) => {
 });
 
 app.post('/api/accounts', async (req, res) => {
-    const { id, userId, name, currency, balance, isDemo, type } = req.body;
+    const { id, userId, name, currency, balance, isDemo, type, eaSecret } = req.body;
+    
+    // Ensure we have a secret
+    const secretToSave = eaSecret || generateSecret();
+
     try {
         await req.db.query(
-            `INSERT INTO accounts (id, user_id, name, currency, balance, is_demo, type)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `INSERT INTO accounts (id, user_id, name, currency, balance, is_demo, type, ea_secret)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET
              user_id = EXCLUDED.user_id, name = EXCLUDED.name, currency = EXCLUDED.currency, 
-             balance = EXCLUDED.balance, is_demo = EXCLUDED.is_demo, type = EXCLUDED.type`,
-            [id, userId, name, currency, balance, isDemo, type]
+             balance = EXCLUDED.balance, is_demo = EXCLUDED.is_demo, type = EXCLUDED.type,
+             ea_secret = COALESCE(EXCLUDED.ea_secret, accounts.ea_secret)`, // Preserve existing if not provided
+            [id, userId, name, currency, balance, isDemo, type, secretToSave]
         );
         const result = await req.db.query('SELECT * FROM accounts WHERE user_id = $1 ORDER BY name ASC', [userId]);
         res.json(result.rows.map(row => ({
@@ -638,7 +656,8 @@ app.post('/api/accounts', async (req, res) => {
             currency: row.currency,
             balance: parseFloat(row.balance),
             isDemo: row.is_demo,
-            type: row.type
+            type: row.type,
+            eaSecret: row.ea_secret
         })));
     } catch (err) {
         if (err.code === '42703') { await ensureSchema(req.db); return res.status(500).json({ error: "Schema updated. Retry." }); }
@@ -674,7 +693,8 @@ app.post('/api/accounts/:id/adjust-balance', async (req, res) => {
             currency: row.currency,
             balance: parseFloat(row.balance),
             isDemo: row.is_demo,
-            type: row.type
+            type: row.type,
+            eaSecret: row.ea_secret
         })));
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -729,18 +749,10 @@ app.post('/api/ea/events', async (req, res) => {
     // STRICT ISOLATION NOTE: This handler must NOT call external APIs (TwelveData/Gemini).
     // It relies solely on the payload provided by the EA and existing DB data.
 
-    const secret = req.headers['x-ea-secret'];
-    const expectedSecret = process.env.EA_SHARED_SECRET;
-
-    // 1. Auth
-    if (!expectedSecret || secret !== expectedSecret) {
-        console.warn(`[EA] Unauthorized access attempt. IP: ${req.ip}`);
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // 2. Validate Body
+    const incomingSecret = req.headers['x-ea-secret'];
     const { eventId, accountId, externalTradeId, type, payload } = req.body;
-    
+
+    // 1. Basic Payload Validation (Fail fast)
     if (!eventId || typeof eventId !== 'string') return res.status(400).json({ error: 'Invalid or missing eventId' });
     if (!accountId || typeof accountId !== 'string') return res.status(400).json({ error: 'Invalid or missing accountId' });
     if (!externalTradeId || typeof externalTradeId !== 'string') return res.status(400).json({ error: 'Invalid or missing externalTradeId' });
@@ -753,6 +765,32 @@ app.post('/api/ea/events', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // 2. Account Fetch & Authentication (Scoped to Account)
+        // We fetch the account to get the secret for validation
+        const accResult = await client.query('SELECT id, ea_secret FROM accounts WHERE id = $1', [accountId]);
+        
+        if (accResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Account not found' });
+        }
+
+        const account = accResult.rows[0];
+        
+        // Auth Logic: Prefer Account Secret, Fallback to Shared Env
+        let isAuthenticated = false;
+        
+        if (account.ea_secret && incomingSecret === account.ea_secret) {
+            isAuthenticated = true;
+        } else if (process.env.EA_SHARED_SECRET && incomingSecret === process.env.EA_SHARED_SECRET) {
+            isAuthenticated = true;
+        }
+
+        if (!isAuthenticated) {
+            console.warn(`[EA] Unauthorized access attempt for account ${accountId}. IP: ${req.ip}`);
+            await client.query('ROLLBACK');
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+
         // 3. Idempotency Check (Check before processing)
         const existCheck = await client.query('SELECT 1 FROM ea_event_logs WHERE event_id = $1', [eventId]);
         if (existCheck.rows.length > 0) {
@@ -760,14 +798,7 @@ app.post('/api/ea/events', async (req, res) => {
             return res.status(200).json({ message: 'Event already processed' });
         }
 
-        // 4. Account Scoping
-        const accCheck = await client.query('SELECT id FROM accounts WHERE id = $1', [accountId]);
-        if (accCheck.rows.length === 0) {
-            await client.query('ROLLBACK');
-            return res.status(404).json({ error: 'Account not found' });
-        }
-
-        // 5. Handle Event Types
+        // 4. Handle Event Types
         if (type === 'ORDER_PLACED') {
             const p = payload;
             
@@ -1150,7 +1181,7 @@ app.post('/api/ea/events', async (req, res) => {
             );
         }
         
-        // 6. Log Event (Success)
+        // 5. Log Event (Success)
         await client.query(
             'INSERT INTO ea_event_logs (event_id, account_id, external_trade_id, type) VALUES ($1, $2, $3, $4)',
             [eventId, accountId, externalTradeId, type]
