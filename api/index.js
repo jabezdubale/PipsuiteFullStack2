@@ -34,13 +34,43 @@ const getDB = () => {
     return pool;
 };
 
-// --- Server-Side Asset Definitions for Normalization ---
-const KNOWN_ASSETS = [
-    "XAUUSD", "EURUSD", "USDJPY", "GBPUSD", "AUDUSD", "NZDUSD", "USDCAD", "USDCHF",
-    "EURJPY", "GBPJPY", "EURAUD", "EURGBP", "AUDJPY", "CADJPY", "CHFJPY",
-    "USOIL", "UKOIL", "XAGUSD", "BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD", "ADAUSD", "SOLUSD", "BNBUSD",
-    "US30", "NAS100", "SPX500", "GER30", "UK100", "JP225"
+// --- Asset Definitions for Calculations ---
+const ASSETS_DEF = [
+  { "assetPair": "XAUUSD", "contractSize": 100, "quote": "USD" },
+  { "assetPair": "EURUSD", "contractSize": 100000, "quote": "USD" },
+  { "assetPair": "USDJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "GBPUSD", "contractSize": 100000, "quote": "USD" },
+  { "assetPair": "AUDUSD", "contractSize": 100000, "quote": "USD" },
+  { "assetPair": "NZDUSD", "contractSize": 100000, "quote": "USD" },
+  { "assetPair": "USDCAD", "contractSize": 100000, "quote": "CAD" },
+  { "assetPair": "USDCHF", "contractSize": 100000, "quote": "CHF" },
+  { "assetPair": "EURJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "GBPJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "EURAUD", "contractSize": 100000, "quote": "AUD" },
+  { "assetPair": "EURGBP", "contractSize": 100000, "quote": "GBP" },
+  { "assetPair": "AUDJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "CADJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "CHFJPY", "contractSize": 100000, "quote": "JPY" },
+  { "assetPair": "USOIL", "contractSize": 1000, "quote": "USD" },
+  { "assetPair": "UKOIL", "contractSize": 1000, "quote": "USD" },
+  { "assetPair": "XAGUSD", "contractSize": 5000, "quote": "USD" },
+  { "assetPair": "BTCUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "ETHUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "XRPUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "LTCUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "ADAUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "SOLUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "BNBUSD", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "US30", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "NAS100", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "SPX500", "contractSize": 1, "quote": "USD" },
+  { "assetPair": "GER30", "contractSize": 1, "quote": "EUR" },
+  { "assetPair": "UK100", "contractSize": 1, "quote": "GBP" },
+  { "assetPair": "JP225", "contractSize": 1, "quote": "JPY" }
 ];
+
+// --- Server-Side Asset Definitions for Normalization ---
+const KNOWN_ASSETS = ASSETS_DEF.map(a => a.assetPair);
 
 // Helper to convert snake_case DB result to camelCase for frontend
 const toCamelCase = (row) => {
@@ -161,6 +191,56 @@ const normalizeEATag = (tag) => {
 
 const generateSecret = () => {
     return 'ea_' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+};
+
+const getAssetInfo = (symbol) => {
+    const normalized = normalizeSymbolToAssetPair(symbol);
+    const def = ASSETS_DEF.find(a => a.assetPair === normalized);
+    if (def) return def;
+    
+    // Fallback heuristic for quote currency
+    let quote = 'USD';
+    if (normalized.length === 6) {
+        quote = normalized.substring(3);
+    }
+    return { assetPair: normalized, contractSize: 100000, quote }; // Default contract size
+};
+
+const DIRECT_PAIRS = new Set(['EUR', 'GBP', 'AUD', 'NZD', 'XAU', 'XAG', 'BTC', 'ETH', 'SOL', 'BNB']);
+
+const fetchTwelveDataRate = async (quoteCurrency, apiKey) => {
+    const code = quoteCurrency.toUpperCase();
+    let pair = '';
+    let isDirect = false;
+
+    if (DIRECT_PAIRS.has(code)) {
+        pair = `${code}USD`;
+        isDirect = true;
+    } else {
+        pair = `USD${code}`;
+        isDirect = false;
+    }
+
+    let querySymbol = pair;
+    if (pair.length === 6) {
+        querySymbol = `${pair.slice(0, 3)}/${pair.slice(3)}`;
+    }
+
+    try {
+        const res = await fetch(`https://api.twelvedata.com/price?symbol=${querySymbol}&apikey=${apiKey}`);
+        if (!res.ok) return null;
+        
+        const data = await res.json();
+        if (!data.price) return null;
+
+        const price = parseFloat(data.price);
+        if (isNaN(price) || price === 0) return null;
+
+        return isDirect ? price : (1 / price);
+    } catch (e) {
+        console.error("FX Fetch Error:", e.message);
+        return null;
+    }
 };
 
 const getOrCreateTradeByExternalId = async (db, accountId, externalTradeId, rawSymbol) => {
@@ -746,9 +826,6 @@ app.get('/api/ea/ping', (req, res) => {
 
 // EA WEBHOOK
 app.post('/api/ea/events', async (req, res) => {
-    // STRICT ISOLATION NOTE: This handler must NOT call external APIs (TwelveData/Gemini).
-    // It relies solely on the payload provided by the EA and existing DB data.
-
     const incomingSecret = req.headers['x-ea-secret'];
     const { eventId, accountId, externalTradeId, type, payload } = req.body;
 
@@ -876,6 +953,77 @@ app.post('/api/ea/events', async (req, res) => {
                 t = await getOrCreateTradeByExternalId(client, accountId, externalTradeId, p.symbol);
             }
 
+            // --- START PLANNED USD CALCULATION (IDEMPOTENT & ONE-TIME) ---
+            // FIX: Use camelCase properties from parsed trade object 't'
+            let plannedRiskUsd = (t.plannedRiskUsd !== undefined) ? t.plannedRiskUsd : null;
+            let plannedRewardUsd = (t.plannedRewardUsd !== undefined) ? t.plannedRewardUsd : null;
+            let fxRateToUsd = (t.fxRateToUsd !== undefined) ? t.fxRateToUsd : null;
+            let quoteCurrency = t.quoteCurrency;
+
+            // Only proceed if values are missing
+            if (plannedRiskUsd === null || plannedRewardUsd === null) {
+                try {
+                    const assetInfo = getAssetInfo(p.symbol);
+                    if (assetInfo) {
+                        quoteCurrency = assetInfo.quote;
+                        const entry = normalizeNumber(p.entryPrice);
+                        const sl = normalizeNumber(p.entryStopLoss);
+                        const tp = normalizeNumber(p.entryTakeProfit);
+                        const qty = normalizeNumber(p.quantity);
+
+                        // Only calculate if critical fields exist
+                        if (entry && qty) {
+                            let riskQuote = 0;
+                            let rewardQuote = 0;
+
+                            if (sl) {
+                                riskQuote = Math.abs(entry - sl) * assetInfo.contractSize * qty;
+                            }
+                            if (tp) {
+                                rewardQuote = Math.abs(tp - entry) * assetInfo.contractSize * qty;
+                            }
+
+                            if (quoteCurrency === 'USD') {
+                                // Direct assignment for USD pairs (No API call)
+                                fxRateToUsd = 1;
+                                if (sl) plannedRiskUsd = riskQuote;
+                                if (tp) plannedRewardUsd = rewardQuote;
+                            } else {
+                                // Fetch Rate via TwelveData (Only for non-USD quote)
+                                // OPTIMIZATION: Use stored rate if available to avoid API call
+                                if (fxRateToUsd === null) {
+                                    // 1. Get API Key for User
+                                    const userRes = await client.query(
+                                        `SELECT u.twelve_data_api_key FROM users u 
+                                         JOIN accounts a ON a.user_id = u.id 
+                                         WHERE a.id = $1`, 
+                                        [accountId]
+                                    );
+                                    const apiKey = userRes.rows[0]?.twelve_data_api_key;
+
+                                    if (apiKey) {
+                                        // 2. Call API
+                                        const rate = await fetchTwelveDataRate(quoteCurrency, apiKey);
+                                        if (rate) {
+                                            fxRateToUsd = rate;
+                                        }
+                                    }
+                                }
+                                
+                                // Calculate using rate (fetched or stored)
+                                if (fxRateToUsd !== null) {
+                                    if (sl) plannedRiskUsd = riskQuote * fxRateToUsd;
+                                    if (tp) plannedRewardUsd = rewardQuote * fxRateToUsd;
+                                }
+                            }
+                        }
+                    }
+                } catch (calcErr) {
+                    console.error("[EA] Failed to calculate planned USD values:", calcErr.message);
+                }
+            }
+            // --- END PLANNED USD CALCULATION ---
+
             const nextSymbol = normalizeSymbolToAssetPair(p.symbol);
             const nextRawSymbol = p.symbol;
             
@@ -920,7 +1068,11 @@ app.post('/api/ea/events', async (req, res) => {
                     tags = $12,
                     is_pending = false,
                     status = 'OPEN',
-                    outcome = 'Open'
+                    outcome = 'Open',
+                    planned_risk_usd = $14,
+                    planned_reward_usd = $15,
+                    quote_currency = $16,
+                    fx_rate_to_usd = $17
                  WHERE id = $13`,
                 [
                     nextSymbol,
@@ -935,7 +1087,12 @@ app.post('/api/ea/events', async (req, res) => {
                     nextNotes,
                     nextEmotional,
                     JSON.stringify(mergedTags),
-                    t.id
+                    t.id,
+                    // New Fields
+                    plannedRiskUsd,
+                    plannedRewardUsd,
+                    quoteCurrency,
+                    fxRateToUsd
                 ]
             );
         } else if (type === 'SLTP_UPDATED') {
