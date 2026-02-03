@@ -1241,12 +1241,29 @@ app.post('/api/ea/events', async (req, res) => {
             if (netPnL > 0) status = 'WIN';
             else if (netPnL < 0) status = 'LOSS';
 
+            // --- Updated Balance Logic for Snapshotting ---
+            let currentAccountBalance = null;
+
             // Idempotent Balance Update
             if (!t.isBalanceUpdated) {
-                await client.query(
-                    'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
+                // Update and fetch new balance
+                const accRes = await client.query(
+                    'UPDATE accounts SET balance = balance + $1 WHERE id = $2 RETURNING balance',
                     [netPnL, accountId]
                 );
+                if (accRes.rows.length > 0) {
+                    currentAccountBalance = parseFloat(accRes.rows[0].balance);
+                }
+            } else {
+                // If already updated, preserve existing snapshot or fetch current if null
+                if (t.balance === null || t.balance === undefined) {
+                     const accRes = await client.query('SELECT balance FROM accounts WHERE id = $1', [accountId]);
+                     if (accRes.rows.length > 0) {
+                         currentAccountBalance = parseFloat(accRes.rows[0].balance);
+                     }
+                } else {
+                    currentAccountBalance = t.balance;
+                }
             }
 
             // Calculate moved tags (SL/TP Moved) redundancy check
@@ -1295,7 +1312,8 @@ app.post('/api/ea/events', async (req, res) => {
                     tags = $9,
                     outcome = 'Closed',
                     is_balance_updated = true,
-                    is_pending = false
+                    is_pending = false,
+                    balance = COALESCE($11, balance)
                  WHERE id = $10`,
                 [
                     exitPrice,
@@ -1307,7 +1325,8 @@ app.post('/api/ea/events', async (req, res) => {
                     netPnL,
                     status,
                     JSON.stringify(nextTags),
-                    tradeId
+                    tradeId,
+                    currentAccountBalance
                 ]
             );
         } else if (type === 'ORDER_CANCELED') {
@@ -1418,6 +1437,19 @@ app.post('/api/trades', async (req, res) => {
     try {
         await client.query('BEGIN');
 
+        // 1. Update Account Balance FIRST to get the new snapshot
+        if (!isNaN(balanceAdj) && balanceAdj !== 0 && t.accountId) {
+            const accRes = await client.query(
+                'UPDATE accounts SET balance = balance + $1 WHERE id = $2 RETURNING balance',
+                [balanceAdj, t.accountId]
+            );
+            if (accRes.rows.length > 0) {
+                // Update the trade's balance snapshot to reflect the post-close account balance
+                t.balance = parseFloat(accRes.rows[0].balance);
+            }
+        }
+
+        // 2. Insert/Update Trade
         const queryText = `
             INSERT INTO trades (
                 id, account_id, symbol, type, status, outcome,
@@ -1456,13 +1488,6 @@ app.post('/api/trades', async (req, res) => {
         `;
         
         await client.query(queryText, mapTradeToParams(t));
-
-        if (!isNaN(balanceAdj) && balanceAdj !== 0 && t.accountId) {
-            await client.query(
-                'UPDATE accounts SET balance = balance + $1 WHERE id = $2',
-                [balanceAdj, t.accountId]
-            );
-        }
 
         await client.query('COMMIT');
 

@@ -11,7 +11,10 @@ import {
   YAxis, 
   Tooltip, 
   CartesianGrid, 
-  ReferenceLine
+  ReferenceLine,
+  ComposedChart,
+  Line,
+  Area
 } from 'recharts';
 import { Trade, TradeStats, TagGroup, TradeOutcome, TradeStatus, ASSETS } from '../types';
 import { 
@@ -199,11 +202,11 @@ const Dashboard: React.FC<DashboardProps> = ({ stats: initialStats, trades, tagG
   const [hourlyFormat12, setHourlyFormat12] = useState(true);
   
   const [visibleWidgets, setVisibleWidgets] = useState({
-      assetMatrix: true, tags: true, heatmap: true, hourly: true, daily: true, expectancy: true, patience: true, holdTimeDistribution: true, holdTime: true,
+      assetMatrix: true, tags: true, heatmap: true, equityCurve: true, hourly: true, daily: true, expectancy: true, patience: true, holdTimeDistribution: true, holdTime: true,
   });
 
   const [widgetOrder, setWidgetOrder] = useState([
-      'assetMatrix', 'tags', 'heatmap', 'hourly', 'daily', 'expectancy', 'patience', 'holdTimeDistribution', 'holdTime'
+      'assetMatrix', 'tags', 'heatmap', 'equityCurve', 'hourly', 'daily', 'expectancy', 'patience', 'holdTimeDistribution', 'holdTime'
   ]);
   const [draggedWidget, setDraggedWidget] = useState<string | null>(null);
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
@@ -213,10 +216,10 @@ const Dashboard: React.FC<DashboardProps> = ({ stats: initialStats, trades, tagG
   useEffect(() => {
     const loadSettings = async () => {
         const savedOrder = await getSetting('pipsuite_dashboard_order', [
-            'assetMatrix', 'tags', 'heatmap', 'hourly', 'daily', 'expectancy', 'patience', 'holdTimeDistribution', 'holdTime'
+            'assetMatrix', 'tags', 'heatmap', 'equityCurve', 'hourly', 'daily', 'expectancy', 'patience', 'holdTimeDistribution', 'holdTime'
         ]);
         const savedVisibility = await getSetting('pipsuite_dashboard_visibility', {
-            assetMatrix: true, tags: true, heatmap: true, hourly: true, daily: true, expectancy: true, patience: true, holdTimeDistribution: true, holdTime: true,
+            assetMatrix: true, tags: true, heatmap: true, equityCurve: true, hourly: true, daily: true, expectancy: true, patience: true, holdTimeDistribution: true, holdTime: true,
         });
         
         setWidgetOrder(prev => {
@@ -338,6 +341,32 @@ const Dashboard: React.FC<DashboardProps> = ({ stats: initialStats, trades, tagG
       });
       return data;
   }, [dashboardTrades]);
+
+  const equityData = useMemo(() => {
+      // Ensure we have balanced trades and sort chronologically
+      const validTrades = [...closedTrades]
+          .filter(t => t.balance !== undefined && t.balance !== null)
+          .sort((a, b) => {
+              const da = new Date(a.exitDate || a.createdAt || 0).getTime();
+              const db = new Date(b.exitDate || b.createdAt || 0).getTime();
+              return da - db;
+          });
+
+      if (validTrades.length === 0) return [];
+
+      let peak = -Infinity;
+      return validTrades.map((t, i) => {
+          const bal = t.balance!;
+          if (bal > peak) peak = bal;
+          const dd = bal - peak;
+          return {
+              name: i + 1,
+              date: t.exitDate ? new Date(t.exitDate).toLocaleDateString() : 'Unknown',
+              balance: bal,
+              drawdown: dd
+          };
+      });
+  }, [closedTrades]);
 
   const hourlyData = useMemo(() => {
       const map = new Array(24).fill(0);
@@ -763,6 +792,59 @@ const Dashboard: React.FC<DashboardProps> = ({ stats: initialStats, trades, tagG
                 </div>
             </WidgetContainer>
           );
+          case 'equityCurve': {
+              const maxDD = equityData.length > 0 ? Math.min(...equityData.map(d => d.drawdown)) : 0;
+              return (
+              <WidgetContainer 
+                  title="Equity & Drawdown" 
+                  icon={TrendingUp}
+                  tooltipTitle="Account Growth & Risk"
+                  tooltipContent={<p><strong>What:</strong> The blue line shows your account balance over time. The red area shows drawdown from the previous peak.</p>}
+                  controls={equityData.length > 0 && <span className="text-[10px] text-loss font-mono">Max DD: ${maxDD.toLocaleString()}</span>}
+                  onDragHandleMouseDown={() => {}}
+              >
+                  {equityData.length === 0 ? (
+                      <div className="h-full flex items-center justify-center text-xs text-textMuted italic">
+                          No closed trades with balance history found.
+                      </div>
+                  ) : (
+                      <ResponsiveContainer width="100%" height="100%">
+                          <ComposedChart data={equityData}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--color-border))" vertical={false} />
+                              <XAxis dataKey="name" hide />
+                              <YAxis 
+                                  yAxisId="left" 
+                                  orientation="left" 
+                                  domain={['auto', 'auto']} 
+                                  fontSize={10} 
+                                  stroke="rgb(var(--color-text-muted))" 
+                                  tickLine={false} 
+                                  axisLine={false}
+                                  tickFormatter={(val) => `$${(val/1000).toFixed(1)}k`}
+                              />
+                              <YAxis 
+                                  yAxisId="right" 
+                                  orientation="right" 
+                                  fontSize={10} 
+                                  stroke="rgb(var(--color-text-muted))" 
+                                  tickLine={false} 
+                                  axisLine={false}
+                              />
+                              <Tooltip 
+                                  contentStyle={{ backgroundColor: 'rgb(var(--color-surface))', borderColor: 'rgb(var(--color-border))', color: 'rgb(var(--color-text-main))' }}
+                                  labelFormatter={(idx) => equityData[Number(idx)-1]?.date || ''}
+                                  formatter={(value: any, name: string) => [
+                                      `$${value.toLocaleString()}`, 
+                                      name === 'balance' ? 'Equity' : 'Drawdown'
+                                  ]}
+                              />
+                              <Area yAxisId="right" type="monotone" dataKey="drawdown" fill="#ef4444" stroke="#ef4444" fillOpacity={0.1} strokeWidth={1} />
+                              <Line yAxisId="left" type="monotone" dataKey="balance" stroke="#3b82f6" dot={false} strokeWidth={2} />
+                          </ComposedChart>
+                      </ResponsiveContainer>
+                  )}
+              </WidgetContainer>
+          )};
           case 'hourly': return (
             <WidgetContainer 
                 title="Hourly Performance" 
